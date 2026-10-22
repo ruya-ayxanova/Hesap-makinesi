@@ -2,7 +2,10 @@ package com.hesap.calc
 
 import android.content.Context
 import android.content.Intent
+import android.graphics.BitmapFactory
 import android.graphics.Color
+import android.graphics.Matrix
+import android.media.ExifInterface
 import android.net.Uri
 import android.os.Bundle
 import android.provider.DocumentsContract
@@ -12,8 +15,10 @@ import android.view.Gravity
 import android.view.WindowManager
 import android.widget.*
 import androidx.activity.ComponentActivity
+import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import java.io.File
+import java.io.FileOutputStream
 import java.util.Locale
 import java.util.UUID
 import javax.crypto.spec.SecretKeySpec
@@ -35,6 +40,8 @@ class MainActivity : ComponentActivity() {
     private var fails = 0
     private var lockedUntil = 0L
     private var expr = ""
+    private var tempFile: File? = null
+    private lateinit var backCb: OnBackPressedCallback
     private var listView: ListView? = null
     private var items: List<Pair<File, String>> = emptyList()
 
@@ -56,6 +63,11 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
+        backCb = object : OnBackPressedCallback(false) {
+            override fun handleOnBackPressed() { closeViewer() }
+        }
+        onBackPressedDispatcher.addCallback(this, backCb)
+        cleanupTemp()
         if (saltFile.exists()) showCalc() else showSetup()
     }
 
@@ -65,6 +77,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun lock() {
+        cleanupTemp()
         key = null
         expr = ""
         showCalc()
@@ -248,8 +261,10 @@ class MainActivity : ComponentActivity() {
     private fun itemMenu(item: Pair<File, String>) {
         android.app.AlertDialog.Builder(this)
             .setTitle(item.second)
-            .setItems(arrayOf("Geri getir", "Kalıcı sil")) { _, i ->
+            .setItems(arrayOf("Aç", "Geri getir", "Kalıcı sil")) { _, i ->
                 if (i == 0) {
+                    openItem(item.first, item.second)
+                } else if (i == 1) {
                     picking = true
                     pendingRestore = item.first
                     savePicker.launch(item.second)
@@ -294,6 +309,96 @@ class MainActivity : ComponentActivity() {
                 refresh()
             }
         }.start()
+    }
+
+    // ---------- Uygulama içi görüntüleyici ----------
+    private fun cleanupTemp() {
+        tempFile?.delete()
+        tempFile = null
+        cacheDir.listFiles()?.forEach { if (it.name.startsWith("view_")) it.delete() }
+        if (::backCb.isInitialized) backCb.isEnabled = false
+    }
+
+    private fun closeViewer() {
+        cleanupTemp()
+        if (key != null) showMain()
+    }
+
+    private fun openItem(f: File, name: String) {
+        val ext = name.substringAfterLast('.', "").lowercase()
+        val kind = when (ext) {
+            "jpg", "jpeg", "png", "webp", "gif", "bmp", "heic" -> 1
+            "mp4", "mkv", "3gp", "webm", "mov", "avi", "m4v",
+            "mp3", "m4a", "wav", "ogg", "aac", "flac" -> 2
+            else -> 0
+        }
+        if (kind == 0) {
+            toast("Bu dosya türü uygulamada açılamıyor. \"Geri getir\" ile çıkarabilirsin.")
+            return
+        }
+        val k = key ?: return
+        toast("Açılıyor...")
+        Thread {
+            try {
+                val t = File(cacheDir, "view_" + UUID.randomUUID() + "." + ext)
+                tempFile = t
+                FileOutputStream(t).use { Crypto.decrypt(k, f, it) }
+                runOnUiThread { if (key != null) showViewer(t, kind) else t.delete() }
+            } catch (e: Exception) {
+                runOnUiThread { toast("Açılamadı") }
+            }
+        }.start()
+    }
+
+    private fun showViewer(t: File, kind: Int) {
+        val root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+        if (kind == 1) {
+            val bmp = loadBitmap(t)
+            if (bmp == null) {
+                toast("Görüntü açılamadı")
+                closeViewer()
+                return
+            }
+            val iv = ImageView(this).apply {
+                scaleType = ImageView.ScaleType.FIT_CENTER
+                setImageBitmap(bmp)
+            }
+            root.addView(iv, FrameLayout.LayoutParams(-1, -1))
+        } else {
+            val vv = VideoView(this)
+            val mc = MediaController(this)
+            mc.setAnchorView(vv)
+            vv.setMediaController(mc)
+            vv.setVideoPath(t.absolutePath)
+            vv.setOnPreparedListener { it.start() }
+            vv.setOnErrorListener { _, _, _ -> toast("Oynatılamadı"); true }
+            root.addView(vv, FrameLayout.LayoutParams(-1, -1, Gravity.CENTER))
+        }
+        val close = Button(this).apply {
+            text = "✕ Kapat"
+            setOnClickListener { closeViewer() }
+        }
+        val lp = FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.END)
+        lp.setMargins(dp(8), dp(32), dp(8), 0)
+        root.addView(close, lp)
+        backCb.isEnabled = true
+        setContentView(root)
+    }
+
+    private fun loadBitmap(f: File): android.graphics.Bitmap? {
+        val o = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(f.absolutePath, o)
+        var s = 1
+        while (o.outWidth / s > 2048 || o.outHeight / s > 2048) s *= 2
+        val opts = BitmapFactory.Options().apply { inSampleSize = s }
+        val bmp = BitmapFactory.decodeFile(f.absolutePath, opts) ?: return null
+        val orient = try {
+            ExifInterface(f.absolutePath).getAttributeInt(ExifInterface.TAG_ORIENTATION, 1)
+        } catch (e: Exception) { 1 }
+        val deg = when (orient) { 6 -> 90f; 3 -> 180f; 8 -> 270f; else -> 0f }
+        if (deg == 0f) return bmp
+        val m = Matrix().apply { postRotate(deg) }
+        return android.graphics.Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
     }
 
     private fun restore(f: File, uri: Uri) {
