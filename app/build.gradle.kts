@@ -21,7 +21,8 @@ android {
     kotlinOptions { jvmTarget = "17" }
 }
 
-dependencies {implementation("androidx.media3:media3-exoplayer:1.3.1")
+dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.activity:activity-ktx:1.9.0")
+    implementation("androidx.media3:media3-exoplayer:1.3.1")
 }
