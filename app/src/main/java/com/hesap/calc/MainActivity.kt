@@ -29,6 +29,9 @@ class OpenDocs : ActivityResultContracts.OpenMultipleDocuments() {
         super.createIntent(context, input).addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
 }
 
+/** kind: 0 = üst klasör, 1 = klasör, 2 = dosya */
+data class Entry(val file: File?, val name: String, val kind: Int)
+
 /**
  * Dışarıdan çalışan bir hesap makinesi görünür.
  * Gizli kodu yazıp "=" a basınca kasa açılır.
@@ -41,9 +44,14 @@ class MainActivity : ComponentActivity() {
     private var lockedUntil = 0L
     private var expr = ""
     private var tempFile: File? = null
+    private var screen: VideoScreen? = null
     private lateinit var backCb: OnBackPressedCallback
     private var listView: ListView? = null
-    private var items: List<Pair<File, String>> = emptyList()
+    private var titleView: TextView? = null
+    private var items: List<Entry> = emptyList()
+    private var curDir: File? = null
+    private var viewing = false
+    private val cur: File get() = curDir ?: vaultDir
 
     private val vaultDir by lazy { File(filesDir, "vault").apply { mkdirs() } }
     private val saltFile get() = File(filesDir, "salt.bin")
@@ -64,7 +72,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
         backCb = object : OnBackPressedCallback(false) {
-            override fun handleOnBackPressed() { closeViewer() }
+            override fun handleOnBackPressed() { if (viewing) closeViewer() else goUp() }
         }
         onBackPressedDispatcher.addCallback(this, backCb)
         cleanupTemp()
@@ -78,6 +86,7 @@ class MainActivity : ComponentActivity() {
 
     private fun lock() {
         cleanupTemp()
+        curDir = null
         key = null
         expr = ""
         showCalc()
@@ -234,46 +243,160 @@ class MainActivity : ComponentActivity() {
     private fun showMain() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(40), dp(20), dp(20))
+            setPadding(dp(16), dp(40), dp(16), dp(16))
         }
-        root.addView(TextView(this).apply { text = "Kasa"; textSize = 24f })
-        root.addView(Button(this).apply {
-            text = "Dosya ekle"
-            setOnClickListener { picking = true; addPicker.launch(arrayOf("*/*")) }
-        })
-        root.addView(Button(this).apply { text = "Kilitle"; setOnClickListener { lock() } })
+        titleView = TextView(this).apply { textSize = 18f; setPadding(dp(4), 0, 0, dp(8)) }
+        root.addView(titleView)
+        val bar = LinearLayout(this)
+        fun barBtn(t: String, action: () -> Unit) {
+            val btn = Button(this).apply { text = t; textSize = 12f; setOnClickListener { action() } }
+            bar.addView(btn, LinearLayout.LayoutParams(0, -2, 1f))
+        }
+        barBtn("Dosya ekle") { picking = true; addPicker.launch(arrayOf("*/*")) }
+        barBtn("Yeni klasör") { newFolderDialog() }
+        barBtn("Kilitle") { lock() }
+        root.addView(bar)
         listView = ListView(this).also {
             root.addView(it, LinearLayout.LayoutParams(-1, 0, 1f))
-            it.setOnItemClickListener { _, _, pos, _ -> itemMenu(items[pos]) }
+            it.setOnItemClickListener { _, _, pos, _ -> onEntryClick(items[pos]) }
+            it.setOnItemLongClickListener { _, _, pos, _ -> onEntryLong(items[pos]); true }
         }
         setContentView(root)
         refresh()
     }
 
-    private fun refresh() {
-        val k = key ?: return
-        items = (vaultDir.listFiles() ?: emptyArray()).mapNotNull { f ->
-            try { f to Crypto.readName(k, f) } catch (e: Exception) { null }
-        }.sortedBy { it.second.lowercase() }
-        listView?.adapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, items.map { it.second })
+    private fun folderName(k: SecretKeySpec, dir: File): String =
+        try { Crypto.readName(k, File(dir, "folder.meta")) } catch (e: Exception) { "?" }
+
+    private fun pathLabel(k: SecretKeySpec): String {
+        val parts = ArrayList<String>()
+        var d: File = cur
+        while (d != vaultDir) {
+            parts.add(0, folderName(k, d))
+            d = d.parentFile ?: break
+        }
+        return "Kasa" + parts.joinToString("") { " / $it" }
     }
 
-    private fun itemMenu(item: Pair<File, String>) {
+    private fun refresh() {
+        val k = key ?: return
+        val all = cur.listFiles() ?: emptyArray()
+        val folders = all.filter { it.isDirectory }
+            .map { Entry(it, folderName(k, it), 1) }
+            .sortedBy { it.name.lowercase() }
+        val files = all.filter { it.isFile && it.name.endsWith(".enc") }
+            .mapNotNull { try { Entry(it, Crypto.readName(k, it), 2) } catch (e: Exception) { null } }
+            .sortedBy { it.name.lowercase() }
+        val list = ArrayList<Entry>()
+        if (cur != vaultDir) list.add(Entry(null, "..", 0))
+        list.addAll(folders)
+        list.addAll(files)
+        items = list
+        titleView?.text = pathLabel(k)
+        backCb.isEnabled = viewing || cur != vaultDir
+        listView?.adapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, list.map {
+            when (it.kind) { 0 -> "⬆  Üst klasör"; 1 -> "📁  " + it.name; else -> it.name }
+        })
+    }
+
+    private fun goUp() {
+        val p = cur.parentFile
+        curDir = if (p == null || cur == vaultDir || p == vaultDir) null else p
+        refresh()
+    }
+
+    private fun onEntryClick(e: Entry) {
+        when (e.kind) {
+            0 -> goUp()
+            1 -> { curDir = e.file; refresh() }
+            else -> fileMenu(e)
+        }
+    }
+
+    private fun onEntryLong(e: Entry) {
+        if (e.kind == 1) folderMenu(e) else if (e.kind == 2) fileMenu(e)
+    }
+
+    private fun fileMenu(e: Entry) {
+        val f = e.file ?: return
         android.app.AlertDialog.Builder(this)
-            .setTitle(item.second)
-            .setItems(arrayOf("Aç", "Geri getir", "Kalıcı sil")) { _, i ->
-                if (i == 0) {
-                    openItem(item.first, item.second)
-                } else if (i == 1) {
-                    picking = true
-                    pendingRestore = item.first
-                    savePicker.launch(item.second)
-                } else {
-                    android.app.AlertDialog.Builder(this)
+            .setTitle(e.name)
+            .setItems(arrayOf("Aç", "Klasöre taşı", "Geri getir", "Kalıcı sil")) { _, i ->
+                when (i) {
+                    0 -> openItem(f, e.name)
+                    1 -> moveDialog(f)
+                    2 -> { picking = true; pendingRestore = f; savePicker.launch(e.name) }
+                    else -> android.app.AlertDialog.Builder(this)
                         .setMessage("Bu dosya kalıcı olarak silinecek.")
-                        .setPositiveButton("Sil") { _, _ -> item.first.delete(); refresh() }
+                        .setPositiveButton("Sil") { _, _ -> f.delete(); refresh() }
                         .setNegativeButton("Vazgeç", null).show()
                 }
+            }.show()
+    }
+
+    private fun folderMenu(e: Entry) {
+        val d = e.file ?: return
+        android.app.AlertDialog.Builder(this)
+            .setTitle(e.name)
+            .setItems(arrayOf("Yeniden adlandır", "Klasörü sil")) { _, i ->
+                if (i == 0) {
+                    nameDialog("Yeni ad", e.name) { n -> writeFolderName(d, n); refresh() }
+                } else {
+                    android.app.AlertDialog.Builder(this)
+                        .setMessage("Klasör ve içindeki tüm dosyalar kalıcı olarak silinecek.")
+                        .setPositiveButton("Sil") { _, _ -> d.deleteRecursively(); refresh() }
+                        .setNegativeButton("Vazgeç", null).show()
+                }
+            }.show()
+    }
+
+    private fun nameDialog(title: String, initial: String, onOk: (String) -> Unit) {
+        val et = EditText(this).apply { setText(initial); setSingleLine() }
+        android.app.AlertDialog.Builder(this)
+            .setTitle(title)
+            .setView(et)
+            .setPositiveButton("Tamam") { _, _ ->
+                val n = et.text.toString().trim()
+                if (n.isNotEmpty()) onOk(n)
+            }
+            .setNegativeButton("Vazgeç", null).show()
+    }
+
+    private fun writeFolderName(dir: File, name: String) {
+        val k = key ?: return
+        File(dir, "folder.meta").outputStream().use { Crypto.encrypt(k, name, "x".byteInputStream(), it) }
+    }
+
+    private fun newFolderDialog() = nameDialog("Klasör adı", "") { n ->
+        val d = File(cur, UUID.randomUUID().toString())
+        d.mkdirs()
+        writeFolderName(d, n)
+        refresh()
+    }
+
+    private fun allFolders(k: SecretKeySpec, dir: File, prefix: String, out: MutableList<Pair<File, String>>) {
+        (dir.listFiles() ?: emptyArray()).filter { it.isDirectory }.forEach {
+            val n = folderName(k, it)
+            out.add(it to (prefix + n))
+            allFolders(k, it, "$prefix$n / ", out)
+        }
+    }
+
+    private fun moveDialog(f: File) {
+        val k = key ?: return
+        val dests = ArrayList<Pair<File, String>>()
+        dests.add(vaultDir to "Kasa (ana dizin)")
+        allFolders(k, vaultDir, "", dests)
+        val opts = dests.filter { it.first != f.parentFile }
+        if (opts.isEmpty()) {
+            toast("Önce bir klasör oluştur")
+            return
+        }
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Nereye taşınsın?")
+            .setItems(opts.map { it.second }.toTypedArray()) { _, i ->
+                toast(if (f.renameTo(File(opts[i].first, f.name))) "Taşındı" else "Taşınamadı")
+                refresh()
             }.show()
     }
 
@@ -285,11 +408,12 @@ class MainActivity : ComponentActivity() {
 
     private fun addFiles(uris: List<Uri>) {
         val k = key ?: return
+        val dest = cur
         toast("Şifreleniyor...")
         Thread {
             var ok = 0; var bad = 0; var kept = 0
             for (uri in uris) {
-                val target = File(vaultDir, UUID.randomUUID().toString() + ".enc")
+                val target = File(dest, UUID.randomUUID().toString() + ".enc")
                 try {
                     val name = displayName(uri)
                     contentResolver.openInputStream(uri)!!.use { i ->
@@ -313,9 +437,12 @@ class MainActivity : ComponentActivity() {
 
     // ---------- Uygulama içi görüntüleyici ----------
     private fun cleanupTemp() {
+        screen?.release()
+        screen = null
         tempFile?.delete()
         tempFile = null
         cacheDir.listFiles()?.forEach { if (it.name.startsWith("view_")) it.delete() }
+        viewing = false
         if (::backCb.isInitialized) backCb.isEnabled = false
     }
 
@@ -351,29 +478,26 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun showViewer(t: File, kind: Int) {
-        val root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
-        if (kind == 1) {
-            val bmp = loadBitmap(t)
-            if (bmp == null) {
-                toast("Görüntü açılamadı")
-                closeViewer()
-                return
-            }
-            val iv = ImageView(this).apply {
-                scaleType = ImageView.ScaleType.FIT_CENTER
-                setImageBitmap(bmp)
-            }
-            root.addView(iv, FrameLayout.LayoutParams(-1, -1))
-        } else {
-            val vv = VideoView(this)
-            val mc = MediaController(this)
-            mc.setAnchorView(vv)
-            vv.setMediaController(mc)
-            vv.setVideoPath(t.absolutePath)
-            vv.setOnPreparedListener { it.start() }
-            vv.setOnErrorListener { _, _, _ -> toast("Oynatılamadı"); true }
-            root.addView(vv, FrameLayout.LayoutParams(-1, -1, Gravity.CENTER))
+        if (kind == 2) {
+            val vs = VideoScreen(this, t) { closeViewer() }
+            screen = vs
+            viewing = true
+            backCb.isEnabled = true
+            setContentView(vs)
+            return
         }
+        val bmp = loadBitmap(t)
+        if (bmp == null) {
+            toast("Görüntü açılamadı")
+            closeViewer()
+            return
+        }
+        val root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+        val iv = ImageView(this).apply {
+            scaleType = ImageView.ScaleType.FIT_CENTER
+            setImageBitmap(bmp)
+        }
+        root.addView(iv, FrameLayout.LayoutParams(-1, -1))
         val close = Button(this).apply {
             text = "✕ Kapat"
             setOnClickListener { closeViewer() }
@@ -381,6 +505,7 @@ class MainActivity : ComponentActivity() {
         val lp = FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.END)
         lp.setMargins(dp(8), dp(32), dp(8), 0)
         root.addView(close, lp)
+        viewing = true
         backCb.isEnabled = true
         setContentView(root)
     }
